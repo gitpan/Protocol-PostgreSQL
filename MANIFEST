@@ -1,0 +1,16 @@
+Changes
+LICENSE
+MANIFEST
+META.yml
+Makefile.PL
+README
+dist.ini
+lib/Protocol/PostgreSQL.pm
+lib/Protocol/PostgreSQL/Client.pm
+lib/Protocol/PostgreSQL/FieldDescription.pm
+lib/Protocol/PostgreSQL/RowDescription.pm
+t/00-pod.t
+t/00-use.t
+t/client.t
+t/protocol.t
+t/run-queries.t
