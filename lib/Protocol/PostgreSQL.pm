@@ -3,7 +3,7 @@ package Protocol::PostgreSQL;
 use strict;
 use warnings;
 
-our $VERSION = '0.001';
+our $VERSION = '0.002';
 
 =head1 NAME
 
@@ -11,7 +11,7 @@ Protocol::PostgreSQL - support for the PostgreSQL wire protocol
 
 =head1 VERSION
 
-version 0.001
+version 0.002
 
 =head1 SYNOPSIS
 
@@ -28,7 +28,7 @@ version 0.001
 
  package main;
  my $client = PostgreSQL::Client->new(user => ..., server => ..., database => ...);
- $client->query(sql => q{select * from table}, on_data_row => sub {
+ $client->simple_query(sql => q{select * from table}, on_data_row => sub {
  	my ($client, %args) = @_;
 	my @cols = $args{row};
 	print join(',', @cols) . "\n";
@@ -136,6 +136,7 @@ use Digest::MD5 ();
 use Time::HiRes ();
 use POSIX qw{strftime};
 use Protocol::PostgreSQL::RowDescription;
+use Protocol::PostgreSQL::Statement;
 
 # Currently v3.0, which is used in PostgreSQL 7.4+
 use constant PROTOCOL_VERSION	=> 0x00030000;
@@ -152,6 +153,7 @@ my %AUTH_TYPE = (
 	8	=> 'AuthenticationGSSContinue',
 );
 
+# Transaction states the backend can be in
 my %BACKEND_STATE = (
 	I	=> 'idle',
 	T	=> 'transaction',
@@ -210,6 +212,7 @@ our %MESSAGE_TYPE_FRONTEND = (
 	CopyDone		=> 'c',
 	CopyFail		=> 'f',
 	Describe		=> 'D',
+	Execute			=> 'E',
 	Flush			=> 'H',
 	FunctionCall		=> 'F',
 	Parse			=> 'P',
@@ -224,18 +227,55 @@ our %FRONTEND_MESSAGE_CODE = reverse %MESSAGE_TYPE_FRONTEND;
 
 # Defined message handlers for outgoing frontend messages
 our %FRONTEND_MESSAGE_BUILDER = (
-# Initial mesage informing the server which database and user we want
-	StartupMessage	=> sub {
+# Bind parameters to an existing prepared statement
+	Bind => sub {
 		my $self = shift;
-		die "Not first message" unless $self->is_first_message;
-
 		my %args = @_;
-		my $parameters = join('', map { pack('Z*', $_) } map { $_, $args{$_} } grep { exists $args{$_} } qw(user database options));
-		$parameters .= "\0";
 
+		$args{param} ||= [];
+		my $param = '';
+		my $count = scalar @{$args{param}};
+		foreach my $p (@{$args{param}}) {
+			if(!defined $p) {
+				$param .= pack('N1', 0xFFFFFFFF);
+			} else {
+				$param .= pack('N1a*', length($p), $p);
+			}
+		}
+		my $msg = pack('Z*Z*n1n1a*n1',
+			defined($args{portal}) ? $args{portal} : '',
+			defined($args{statement}) ? $args{statement} : '',
+			0,		# Parameter types
+			$count,		# Number of bound parameters
+			$param,		# Actual parameter values
+			0		# Number of result column format definitions (0=use default text format)
+		);
 		return $self->_build_message(
-			type	=> undef,
-			data	=> pack('N*', PROTOCOL_VERSION) . $parameters
+			type	=> 'Bind',
+			data	=> $msg,
+		);
+	},
+# Execute either a named or anonymous portal (prepared statement with bind vars)
+	Execute => sub {
+		my $self = shift;
+		my %args = @_;
+
+		my $msg = pack('Z*N1', defined($args{portal}) ? $args{portal} : '', $args{limit} || 0);
+		return $self->_build_message(
+			type	=> 'Execute',
+			data	=> $msg,
+		);
+	},
+# Parse SQL for a prepared statement
+	Parse => sub {
+		my $self = shift;
+		my %args = @_;
+		die "No SQL provided" unless defined $args{sql};
+
+		my $msg = pack('Z*Z*n1', defined($args{statement}) ? $args{statement} : '', $args{sql}, 0);
+		return $self->_build_message(
+			type	=> 'Parse',
+			data	=> $msg,
 		);
 	},
 # Password data, possibly encrypted depending on what the server specified
@@ -269,9 +309,32 @@ our %FRONTEND_MESSAGE_BUILDER = (
 			type	=> 'Query',
 			data	=> pack('Z*', $args{sql})
 		);
-	}
+	},
+# Initial mesage informing the server which database and user we want
+	StartupMessage	=> sub {
+		my $self = shift;
+		die "Not first message" unless $self->is_first_message;
+
+		my %args = @_;
+		my $parameters = join('', map { pack('Z*', $_) } map { $_, $args{$_} } grep { exists $args{$_} } qw(user database options));
+		$parameters .= "\0";
+
+		return $self->_build_message(
+			type	=> undef,
+			data	=> pack('N*', PROTOCOL_VERSION) . $parameters
+		);
+	},
+# Synchonise after a prepared statement has finished execution.
+	Sync => sub {
+		my $self = shift;
+		return $self->_build_message(
+			type	=> 'Sync',
+			data	=> '',
+		);
+	},
 );
 
+# Handlers for specification authentication messages from backend.
 my %AUTH_HANDLER = (
 	AuthenticationOk => sub {
 		my ($self, $msg) = @_;
@@ -314,6 +377,7 @@ my %AUTH_HANDLER = (
 
 # Defined message handlers for incoming messages from backend
 our %BACKEND_MESSAGE_HANDLER = (
+# We had some form of authentication request or response, pass it over to an auth handler to deal with it further.
 	AuthenticationRequest	=> sub {
 		my $self = shift;
 		my $msg = shift;
@@ -323,45 +387,51 @@ our %BACKEND_MESSAGE_HANDLER = (
 		$self->debug("Auth message [$auth_type]");
 		return $AUTH_HANDLER{$auth_type}->($self, $msg);
 	},
-	ReadyForQuery	=> sub {
+# Key data for cancellation requests
+	BackendKeyData	=> sub {
 		my $self = shift;
 		my $msg = shift;
-		my (undef, undef, $state) = unpack('C1N1A1', $msg);
-		$self->debug("Backend state is $state");
-		$self->backend_state($BACKEND_STATE{$state});
-		$self->_event('ready_for_query');
+		(undef, my $size, my $pid, my $key) = unpack('C1N1N1N1', $msg);
+		$self->_event('backendkeydata',
+			pid	=> $pid,
+			key	=> $key
+		);
 	},
-	EmptyQueryResponse => sub {
+# A bind operation has completed
+	BindComplete	=> sub {
 		my $self = shift;
 		my $msg = shift;
-		$self->_event('empty_query');
-		$self->_event('ready_for_query');
+		(undef, my $size) = unpack('C1N1', $msg);
+		$self->_event('bind_complete');
 	},
-	RowDescription => sub {
+# We have closed the connection to the server successfully
+	CloseComplete	=> sub {
 		my $self = shift;
 		my $msg = shift;
-		my (undef, undef, $count) = unpack('C1N1n1', $msg);
-		my $row = Protocol::PostgreSQL::RowDescription->new;
-		substr $msg, 0, 7, '';
-		foreach my $id (0..$count-1) {
-			my ($name, $table_id, $field_id, $data_type, $data_size, $type_modifier, $format_code) = unpack('Z*N1n1N1n1N1n1', $msg);
-			my %data = (
-				name		=> $name,
-				table_id	=> $table_id,
-				field_id	=> $field_id,
-				data_type	=> $data_type,
-				data_size	=> $data_size,
-				type_modifier	=> $type_modifier,
-				format_code	=> $format_code
-			);
-			$self->debug($_ . ' => ' . $data{$_}) for sort keys %data;
-			my $field = Protocol::PostgreSQL::FieldDescription->new(%data);
-			$row->add_field($field);
-			substr $msg, 0, 19 + length($name), '';
+		(undef, my $size) = unpack('C1N1', $msg);
+		$self->_event('close_complete');
+	},
+# A command has completed, we should see a ready response immediately after this
+	CommandComplete => sub {
+		my $self = shift;
+		my $msg = shift;
+		my (undef, undef, $result) = unpack('C1N1Z*', $msg);
+		$self->_event('command_complete', result => $result);
+	},
+# We have a COPY response from the server indicating that it's ready to accept COPY data
+	CopyInResponse => sub {
+		my $self = shift;
+		my $msg = shift;
+		(undef, undef, my $type, my $count) = unpack('C1N1C1n1', $msg);
+		substr $msg, 0, 8, '';
+		my @formats;
+		for (1..$count) {
+			push @formats, unpack('n1', $msg);
+			substr $msg, 0, 2, '';
 		}
-		$self->row_description($row);
-		$self->_event('row_description', description => $row);
+		$self->_event('copy_in_response', count => $count, columns => \@formats);
 	},
+# The basic SQL result - a single row of data
 	DataRow => sub {
 		my $self = shift;
 		my $msg = shift;
@@ -389,35 +459,14 @@ our %BACKEND_MESSAGE_HANDLER = (
 		}
 		$self->_event('data_row', row => \@fields);
 	},
-	CommandComplete => sub {
+# Response given when empty query (whitespace only) is provided
+	EmptyQueryResponse => sub {
 		my $self = shift;
 		my $msg = shift;
-		my (undef, undef, $result) = unpack('C1N1Z*', $msg);
-		$self->_event('command_complete', result => $result);
+		$self->_event('empty_query');
+		$self->_event('ready_for_query');
 	},
-	NoticeResponse => sub {
-		my $self = shift;
-		my $msg = shift;
-		(undef, my $size) = unpack('C1N1', $msg);
-		substr $msg, 0, 5, '';
-		my %notice;
-		FIELD:
-		while(length($msg)) {
-			my ($code, $str) = unpack('A1Z*', $msg);
-			last FIELD unless $code && $code ne "\0";
-
-			die "Unknown NOTICE code [$code]" unless exists $NOTICE_CODE{$code};
-			$notice{$NOTICE_CODE{$code}} = $str;
-			substr $msg, 0, 2+length($str), '';
-		}
-		$self->_event('notice', notice => \%notice);
-	},
-	NotificationReponse => sub {
-		my $self = shift;
-		my $msg = shift;
-		(undef, my $size, my $pid, my $channel, my $data) = unpack('C1N1N1Z*Z*', $msg);
-		$self->_event('notification', pid => $pid, channel => $channel, data => $data);
-	},
+# An error occurred, can indicate that connection is about to close or just be a warning
 	ErrorResponse => sub {
 		my $self = shift;
 		my $msg = shift;
@@ -435,6 +484,48 @@ our %BACKEND_MESSAGE_HANDLER = (
 		}
 		$self->_event('error', error => \%notice);
 	},
+# Result from calling a function
+	FunctionCallResponse	=> sub {
+		my $self = shift;
+		my $msg = shift;
+		(undef, my $size, my $len) = unpack('C1N1N1', $msg);
+		substr $msg, 0, 9, '';
+		my $data = ($len == 0xFFFFFFFF) ? undef : substr $msg, 0, $len;
+		$self->_event('function_call_response', data => $data);
+	},
+# No data follows
+	NoData	=> sub {
+		my $self = shift;
+		my $msg = shift;
+		(undef, my $size) = unpack('C1N1', $msg);
+		$self->_event('no_data');
+	},
+# We have a notice, which is like an error but can be just informational
+	NoticeResponse => sub {
+		my $self = shift;
+		my $msg = shift;
+		(undef, my $size) = unpack('C1N1', $msg);
+		substr $msg, 0, 5, '';
+		my %notice;
+		FIELD:
+		while(length($msg)) {
+			my ($code, $str) = unpack('A1Z*', $msg);
+			last FIELD unless $code && $code ne "\0";
+
+			die "Unknown NOTICE code [$code]" unless exists $NOTICE_CODE{$code};
+			$notice{$NOTICE_CODE{$code}} = $str;
+			substr $msg, 0, 2+length($str), '';
+		}
+		$self->_event('notice', notice => \%notice);
+	},
+# LISTEN/NOTIFY mechanism
+	NotificationReponse => sub {
+		my $self = shift;
+		my $msg = shift;
+		(undef, my $size, my $pid, my $channel, my $data) = unpack('C1N1N1Z*Z*', $msg);
+		$self->_event('notification', pid => $pid, channel => $channel, data => $data);
+	},
+# Connection parameter information
 	ParameterStatus	=> sub {
 		my $self = shift;
 		my $msg = shift;
@@ -451,15 +542,69 @@ our %BACKEND_MESSAGE_HANDLER = (
 		}
 		$self->_event('parameter_status', status => \%status);
 	},
-	BackendKeyData	=> sub {
+# Description of the format that subsequent parameters are using, typically plaintext only
+	ParameterDescription => sub {
 		my $self = shift;
 		my $msg = shift;
-		(undef, my $size, my $pid, my $key) = unpack('C1N1N1N1', $msg);
-		$self->_event('backendkeydata',
-			pid	=> $pid,
-			key	=> $key
-		);
-	}
+		(undef, my $size, my $count) = unpack('C1N1n1', $msg);
+		substr $msg, 0, 7, '';
+		my @oid_list;
+		for my $idx (1..$count) {
+			my ($oid) = unpack('N1', $msg);
+			substr $msg, 0, 4, '';
+			push @oid_list, $oid;
+		}
+		$self->_event('parameter_description', parameters => \@oid_list);
+	},
+# Parse request succeeded
+	ParseComplete	=> sub {
+		my $self = shift;
+		my $msg = shift;
+		(undef, my $size) = unpack('C1N1', $msg);
+		$self->_event('parse_complete');
+	},
+# Portal has sent enough data to meet the row limit, should be requested again if more is required
+	PortalSuspended	=> sub {
+		my $self = shift;
+		my $msg = shift;
+		(undef, my $size) = unpack('C1N1', $msg);
+		$self->_event('portal_suspended');
+	},
+# All ready to accept queries
+	ReadyForQuery	=> sub {
+		my $self = shift;
+		my $msg = shift;
+		my (undef, undef, $state) = unpack('C1N1A1', $msg);
+		$self->debug("Backend state is $state");
+		$self->backend_state($BACKEND_STATE{$state});
+		$self->_event('ready_for_query');
+	},
+# Information on the row data that's expected to follow
+	RowDescription => sub {
+		my $self = shift;
+		my $msg = shift;
+		my (undef, undef, $count) = unpack('C1N1n1', $msg);
+		my $row = Protocol::PostgreSQL::RowDescription->new;
+		substr $msg, 0, 7, '';
+		foreach my $id (0..$count-1) {
+			my ($name, $table_id, $field_id, $data_type, $data_size, $type_modifier, $format_code) = unpack('Z*N1n1N1n1N1n1', $msg);
+			my %data = (
+				name		=> $name,
+				table_id	=> $table_id,
+				field_id	=> $field_id,
+				data_type	=> $data_type,
+				data_size	=> $data_size,
+				type_modifier	=> $type_modifier,
+				format_code	=> $format_code
+			);
+			$self->debug($_ . ' => ' . $data{$_}) for sort keys %data;
+			my $field = Protocol::PostgreSQL::FieldDescription->new(%data);
+			$row->add_field($field);
+			substr $msg, 0, 19 + length($name), '';
+		}
+		$self->row_description($row);
+		$self->_event('row_description', description => $row);
+	},
 );
 
 =head1 METHODS
@@ -652,6 +797,38 @@ sub row_description {
 		return $self;
 	}
 	return $self->{row_description};
+}
+
+sub prepare {
+	my $self = shift;
+	my $sql = shift;
+	return $self->prepare_async(sql => $sql);
+}
+
+sub prepare_async {
+	my $self = shift;
+	my %args = @_;
+	die "SQL statement not provided" unless defined $args{sql};
+
+	my $sth = Protocol::PostgreSQL::Statement->new(
+		dbh	=> $self,
+		sql	=> $args{sql}
+	);
+	return $sth;
+}
+
+sub send_copy_data {
+	my $self = shift;
+	my $data = shift;
+	foreach (@$data) {
+		my $v = $_;
+		$v =~ s/\\/\\\\/g;
+		$v =~ s/\x08/\\b/g;
+		$v =~ s/\f/\\f/g;
+		$v =~ s/\n/\\n/g;
+		$v =~ s/\t/\\t/g;
+		$v =~ s/\v/\\v/g;
+	}
 }
 
 =head2 _event

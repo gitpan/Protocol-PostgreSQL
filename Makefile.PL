@@ -11,7 +11,9 @@ use ExtUtils::MakeMaker 6.31;
 my %WriteMakefileArgs = (
   'ABSTRACT' => 'PostgreSQL wire protocol',
   'AUTHOR' => 'Tom Molesworth <cpan@entitymodel.com>',
-  'BUILD_REQUIRES' => {},
+  'BUILD_REQUIRES' => {
+    'Test::Exception' => '0'
+  },
   'CONFIGURE_REQUIRES' => {
     'ExtUtils::MakeMaker' => '6.31'
   },
@@ -22,9 +24,10 @@ my %WriteMakefileArgs = (
   'PREREQ_PM' => {
     'Digest::MD5' => '0',
     'POSIX' => '0',
-    'Time::HiRes' => '0'
+    'Time::HiRes' => '0',
+    'parent' => '0'
   },
-  'VERSION' => '0.001',
+  'VERSION' => '0.002',
   'test' => {
     'TESTS' => 't/*.t'
   }

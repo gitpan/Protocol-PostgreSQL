@@ -1,7 +1,7 @@
 use strict;
 use warnings;
 
-use Test::More tests => 67;
+use Test::More tests => 68;
 use Test::Exception;
 use Protocol::PostgreSQL;
 

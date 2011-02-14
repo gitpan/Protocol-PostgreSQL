@@ -2,7 +2,7 @@ use strict;
 use warnings;
 
 # Client specific protocol tests, with simulated server responses
-use Test::More tests => 77;
+use Test::More tests => 93;
 use Protocol::PostgreSQL::Client;
 
 # helper for checking we're constructing the right message
@@ -180,5 +180,37 @@ is($notice->{code}, 123, 'notice - code is correct');
 is($notice->{severity}, 'INFO', 'notice - severity is correct');
 is($notice->{message}, 'Some info text', 'notice - message is correct');
 is($notice->{detail}, 'Longer information here', 'notice - description is correct');
+
+# Now an extended query
+undef $row_desc;
+undef $data_row;
+is(@queue, 0, 'queue is empty');
+ok(my $sth = $pg->prepare(q{select "id", "name" from "table" where "name" like ? order by "name"}), 'prepare query');
+is(@queue, 1, 'queue has an entry');
+
+$msg = shift(@queue);
+is_hex($msg, '50 00 00 00 4c 00 73 65 6c 65 63 74 20 22 69 64 22 2c 20 22 6e 61 6d 65 22 20 66 72 6f 6d 20 22 74 61 62 6c 65 22 20 77 68 65 72 65 20 22 6e 61 6d 65 22 20 6c 69 6b 65 20 3f 20 6f 72 64 65 72 20 62 79 20 22 6e 61 6d 65 22 00 00 00', 'prepare statement was correct');
+
+is(@queue, 0, 'queue is empty');
+ok($sth->bind('t%'), 'bind parameters');
+is(@queue, 1, 'queue has an entry');
+
+$msg = shift(@queue);
+is_hex($msg, '42 00 00 00 12 00 00 00 00 00 01 00 00 00 02 74 25 00 00', 'bind message was correct');
+
+is(@queue, 0, 'queue is empty');
+ok($sth->execute, 'execute query');
+is(@queue, 1, 'queue has an entry');
+
+$msg = shift(@queue);
+is_hex($msg, '45 00 00 00 09 00 00 00 00 00', 'execute statement was correct');
+
+is(@queue, 0, 'queue is empty');
+ok($sth->finish, 'finish query');
+is(@queue, 1, 'queue has an entry');
+
+$msg = shift(@queue);
+is_hex($msg, '53 00 00 00 04', 'finish/sync statement was correct');
+
 exit 0;
 

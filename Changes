@@ -1,3 +1,6 @@
+0.002     2011-02-14 00:21:32 Europe/London
+	Basic support for prepared queries and COPY.
+
 0.001     2011-02-12 12:40:54 Europe/London
 	Preliminary release to CPAN.
 
