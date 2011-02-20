@@ -3,7 +3,7 @@ package Protocol::PostgreSQL;
 use strict;
 use warnings;
 
-our $VERSION = '0.002';
+our $VERSION = '0.003';
 
 =head1 NAME
 
@@ -11,7 +11,7 @@ Protocol::PostgreSQL - support for the PostgreSQL wire protocol
 
 =head1 VERSION
 
-version 0.002
+version 0.003
 
 =head1 SYNOPSIS
 
@@ -255,6 +255,21 @@ our %FRONTEND_MESSAGE_BUILDER = (
 			data	=> $msg,
 		);
 	},
+	CopyData => sub {
+		my $self = shift;
+		my %args = @_;
+		return $self->_build_message(
+			type	=> 'CopyData',
+			data	=> pack('a*', $args{data})
+		);
+	},
+	CopyDone => sub {
+		my $self = shift;
+		return $self->_build_message(
+			type	=> 'CopyDone',
+			data	=> '',
+		);
+	},
 # Execute either a named or anonymous portal (prepared statement with bind vars)
 	Execute => sub {
 		my $self = shift;
@@ -447,8 +462,6 @@ our %BACKEND_MESSAGE_HANDLER = (
 			my $null = ($size == 0xFFFFFFFF);
 			unless($null) {
 				$data = $field->parse_data($msg, $size);
-#				($data) = unpack("C$size", $msg);
-				use Data::Dumper;
 				substr $msg, 0, $size, '';
 			}
 			push @fields, {
@@ -757,6 +770,8 @@ sub message_length {
 
 =head2 simple_query
 
+Send a simple query to the server - only supports plain queries (no bind parameters).
+
 =cut
 
 sub simple_query {
@@ -764,6 +779,34 @@ sub simple_query {
 	my $sql = shift;
 	die "Invalid backend state" if $self->backend_state eq 'error';
 	$self->send_message('Query', sql => $sql);
+	return $self;
+}
+
+=head2 copy_data
+
+Send copy data to the server.
+
+=cut
+
+sub copy_data {
+	my $self = shift;
+	my $data = shift;
+	die "Invalid backend state" if $self->backend_state eq 'error';
+	$self->send_message('CopyData', data => $data);
+	return $self;
+}
+
+=head2 copy_done
+
+Indicate that the COPY data from the client is complete.
+
+=cut
+
+sub copy_done {
+	my $self = shift;
+	my $data = shift;
+	die "Invalid backend state" if $self->backend_state eq 'error';
+	$self->send_message('CopyDone');
 	return $self;
 }
 
