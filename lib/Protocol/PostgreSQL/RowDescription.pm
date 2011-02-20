@@ -1,6 +1,6 @@
 package Protocol::PostgreSQL::RowDescription;
 BEGIN {
-  $Protocol::PostgreSQL::RowDescription::VERSION = '0.003';
+  $Protocol::PostgreSQL::RowDescription::VERSION = '0.004';
 }
 use strict;
 use warnings;
@@ -11,7 +11,7 @@ Protocol::PostgreSQL::RowDescription - row definitions
 
 =head1 VERSION
 
-version 0.003
+version 0.004
 
 =head1 SYNOPSIS
 

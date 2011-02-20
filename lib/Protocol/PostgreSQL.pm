@@ -3,7 +3,7 @@ package Protocol::PostgreSQL;
 use strict;
 use warnings;
 
-our $VERSION = '0.003';
+our $VERSION = '0.004';
 
 =head1 NAME
 
@@ -11,7 +11,7 @@ Protocol::PostgreSQL - support for the PostgreSQL wire protocol
 
 =head1 VERSION
 
-version 0.003
+version 0.004
 
 =head1 SYNOPSIS
 
@@ -778,6 +778,7 @@ sub simple_query {
 	my $self = shift;
 	my $sql = shift;
 	die "Invalid backend state" if $self->backend_state eq 'error';
+	$self->debug("Running query [$sql]");
 	$self->send_message('Query', sql => $sql);
 	return $self;
 }
@@ -863,15 +864,22 @@ sub prepare_async {
 sub send_copy_data {
 	my $self = shift;
 	my $data = shift;
+	my @out;
 	foreach (@$data) {
 		my $v = $_;
-		$v =~ s/\\/\\\\/g;
-		$v =~ s/\x08/\\b/g;
-		$v =~ s/\f/\\f/g;
-		$v =~ s/\n/\\n/g;
-		$v =~ s/\t/\\t/g;
-		$v =~ s/\v/\\v/g;
+		if(defined $v) {
+			$v =~ s/\\/\\\\/g;
+			$v =~ s/\x08/\\b/g;
+			$v =~ s/\f/\\f/g;
+			$v =~ s/\n/\\n/g;
+			$v =~ s/\t/\\t/g;
+			$v =~ s/\v/\\v/g;
+		} else {
+			$v = '\N';
+		}
+		push @out, $v;
 	}
+	$self->copy_data(join("\t", @out) . "\n");
 }
 
 =head2 _event

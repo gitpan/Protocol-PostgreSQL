@@ -1,3 +1,6 @@
+0.004     2011-02-20 04:25:53 Europe/London
+	Finish send_copy_data implementation.
+
 0.003     2011-02-20 02:28:32 Europe/London
 	Primitive support for the extra COPY callbacks.
 
