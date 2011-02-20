@@ -1,6 +1,6 @@
 package Protocol::PostgreSQL::Statement;
 BEGIN {
-  $Protocol::PostgreSQL::Statement::VERSION = '0.004';
+  $Protocol::PostgreSQL::Statement::VERSION = '0.005';
 }
 use strict;
 use warnings;
@@ -11,7 +11,7 @@ Protocol::PostgreSQL::Statement - prepared statement handling
 
 =head1 VERSION
 
-version 0.004
+version 0.005
 
 =head1 SYNOPSIS
 
@@ -52,10 +52,19 @@ sub new {
 	die "No SQL?" unless defined $args{sql};
 
 	my $self = bless {
-		dbh	=> $args{dbh},
-		sql	=> $args{sql},
+		dbh	        => $args{dbh},
+		sql	        => $args{sql},
+                  (exists $args{statement})
+                ? (statement    => $args{statement})
+                : (),
 	}, $class;
-	$self->dbh->send_message('Parse', sql => $args{sql});
+	$self->dbh->send_message(
+		'Parse',
+		sql => $args{sql},
+		  (exists $args{statement})
+		? (statement    => $args{statement})
+		: ()
+	);
 	return $self;
 }
 
@@ -67,7 +76,13 @@ Bind variables to the current statement.
 
 sub bind {
 	my $self = shift;
-	$self->dbh->send_message('Bind', param => [ @_ ]);
+	$self->dbh->send_message(
+		'Bind',
+		param => [ @_ ],
+		  (exists $self->{statement})
+		? (statement	=> $self->{statement})
+		: ()
+	);
 }
 
 =head2 C<execute>
@@ -78,7 +93,44 @@ Execute this query.
 
 sub execute {
 	my $self = shift;
-	$self->dbh->send_message('Execute');
+	$self->dbh->row_description($self->row_description);
+	$self->dbh->send_message(
+		'Execute',
+		param => [ @_ ],
+		sth => $self,
+#		  (exists $self->{statement})
+#		? (portal => $self->{statement})
+#		: ()
+	);
+}
+
+=head2 C<describe>
+
+Describe this query.
+
+=cut
+
+sub describe {
+	my $self = shift;
+	$self->dbh->active_statement($self);
+	$self->dbh->send_message(
+		'Describe',
+		param => [ @_ ],
+		  (exists $self->{statement})
+		? (statement => $self->{statement})
+		: (),
+		sth => $self,
+	);
+}
+
+use Data::Dumper;
+sub row_description {
+	my $self = shift;
+	if(@_) {
+		$self->{row_description} = shift;
+		return $self;
+	}
+	return $self->{row_description};
 }
 
 =head1 C<finish>

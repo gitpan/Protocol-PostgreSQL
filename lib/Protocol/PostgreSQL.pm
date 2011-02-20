@@ -3,7 +3,7 @@ package Protocol::PostgreSQL;
 use strict;
 use warnings;
 
-our $VERSION = '0.004';
+our $VERSION = '0.005';
 
 =head1 NAME
 
@@ -11,7 +11,7 @@ Protocol::PostgreSQL - support for the PostgreSQL wire protocol
 
 =head1 VERSION
 
-version 0.004
+version 0.005
 
 =head1 SYNOPSIS
 
@@ -250,6 +250,15 @@ our %FRONTEND_MESSAGE_BUILDER = (
 			$param,		# Actual parameter values
 			0		# Number of result column format definitions (0=use default text format)
 		);
+		$self->debug(
+			join('',
+				"Bind",
+				defined($args{portal}) ? " for portal [" . $args{portal} . "]" : '',
+				defined($args{statement}) ? " for statement [" . $args{statement} . "]" : '',
+				" with $count parameter(s): ",
+				join(',', @{$args{param}})
+			)
+		);
 		return $self->_build_message(
 			type	=> 'Bind',
 			data	=> $msg,
@@ -270,12 +279,26 @@ our %FRONTEND_MESSAGE_BUILDER = (
 			data	=> '',
 		);
 	},
+# Describe expected SQL results
+	Describe => sub {
+		my $self = shift;
+		my %args = @_;
+
+		my $msg = pack('a1Z*', exists $args{portal} ? 'P' : 'S', defined($args{statement}) ? $args{statement} : (defined($args{portal}) ? $args{portal} : ''));
+		push @{$self->{pending_describe}}, $args{sth} if $args{sth};
+		return $self->_build_message(
+			type	=> 'Describe',
+			data	=> $msg,
+		);
+	},
 # Execute either a named or anonymous portal (prepared statement with bind vars)
 	Execute => sub {
 		my $self = shift;
 		my %args = @_;
 
 		my $msg = pack('Z*N1', defined($args{portal}) ? $args{portal} : '', $args{limit} || 0);
+		push @{$self->{pending_execute}}, $args{sth} if $args{sth};
+		$self->debug("Executing " . (defined($args{portal}) ? "portal " . $args{portal} : "default portal") . ($args{limit} ? " with limit " . $args{limit} : " with no limit"));
 		return $self->_build_message(
 			type	=> 'Execute',
 			data	=> $msg,
@@ -431,6 +454,10 @@ our %BACKEND_MESSAGE_HANDLER = (
 		my $self = shift;
 		my $msg = shift;
 		my (undef, undef, $result) = unpack('C1N1Z*', $msg);
+		if(@{$self->{pending_execute}}) {
+			my $last = shift @{$self->{pending_execute}};
+			$self->debug("Finished command for $last");
+		}
 		$self->_event('command_complete', result => $result);
 	},
 # We have a COPY response from the server indicating that it's ready to accept COPY data
@@ -453,7 +480,8 @@ our %BACKEND_MESSAGE_HANDLER = (
 		my (undef, undef, $count) = unpack('C1N1n1', $msg);
 		substr $msg, 0, 7, '';
 		my @fields;
-		my $desc = $self->row_description;
+		# TODO Tidy this up
+		my $desc = @{$self->{pending_execute}} ? $self->{pending_execute}[0]->row_description : $self->row_description;
 		foreach my $idx (0..$count-1) {
 			my $field = $desc->field_index($idx);
 			my ($size) = unpack('N1', $msg);
@@ -476,6 +504,10 @@ our %BACKEND_MESSAGE_HANDLER = (
 	EmptyQueryResponse => sub {
 		my $self = shift;
 		my $msg = shift;
+		if(@{$self->{pending_execute}}) {
+			my $last = shift @{$self->{pending_execute}};
+			$self->debug("Finished command for $last");
+		}
 		$self->_event('empty_query');
 		$self->_event('ready_for_query');
 	},
@@ -494,6 +526,10 @@ our %BACKEND_MESSAGE_HANDLER = (
 			die "Unknown NOTICE code [$code]" unless exists $NOTICE_CODE{$code};
 			$notice{$NOTICE_CODE{$code}} = $str;
 			substr $msg, 0, 2+length($str), '';
+		}
+		if(@{$self->{pending_execute}}) {
+			my $last = shift @{$self->{pending_execute}};
+			$self->debug("Error for $last");
 		}
 		$self->_event('error', error => \%notice);
 	},
@@ -581,6 +617,10 @@ our %BACKEND_MESSAGE_HANDLER = (
 		my $self = shift;
 		my $msg = shift;
 		(undef, my $size) = unpack('C1N1', $msg);
+		if(@{$self->{pending_execute}}) {
+			my $last = shift @{$self->{pending_execute}};
+			$self->debug("Suspended portal for $last");
+		}
 		$self->_event('portal_suspended');
 	},
 # All ready to accept queries
@@ -616,6 +656,9 @@ our %BACKEND_MESSAGE_HANDLER = (
 			substr $msg, 0, 19 + length($name), '';
 		}
 		$self->row_description($row);
+		if(my $last = shift @{$self->{pending_describe}}) {
+			$last->row_description($row);
+		}
 		$self->_event('row_description', description => $row);
 	},
 );
@@ -639,6 +682,8 @@ sub new {
 sub init {
 	my $self = shift;
 	my %args = @_;
+	$self->{pending_execute} = [];
+	$self->{pending_describe} = [];
 	$self->{authenticated} = 0;
 	$self->{message_count} = 0;
 	$self->{debug} = 1 if delete $args{debug};
@@ -828,6 +873,19 @@ sub backend_state {
 	return $self->{backend_state};
 }
 
+=head2 C<active_statement>
+
+=cut
+
+sub active_statement {
+	my $self = shift;
+	if(@_) {
+		$self->{active_statement} = shift;
+		return $self;
+	}
+	return $self->{active_statement};
+}
+
 =head2 row_description
 
 Accessor for row description.
@@ -856,7 +914,7 @@ sub prepare_async {
 
 	my $sth = Protocol::PostgreSQL::Statement->new(
 		dbh	=> $self,
-		sql	=> $args{sql}
+		%args,
 	);
 	return $sth;
 }
