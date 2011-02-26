@@ -1,3 +1,7 @@
+0.006     2011-02-26 18:55:27 Europe/London
+	More support for COPY IN, interleaved prepared statements and callbacks for data_row / no_data conditions.
+	Improved performance slightly by moving some slow debug handling into coderefs.
+
 0.005     2011-02-20 18:14:42 Europe/London
 	Better handling of interleaved prepared statements (need to be named for this to work as expected).
 

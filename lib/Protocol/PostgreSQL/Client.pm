@@ -1,6 +1,6 @@
 package Protocol::PostgreSQL::Client;
 BEGIN {
-  $Protocol::PostgreSQL::Client::VERSION = '0.005';
+  $Protocol::PostgreSQL::Client::VERSION = '0.006';
 }
 use strict;
 use warnings;
@@ -12,7 +12,7 @@ Protocol::PostgreSQL::Client - support for the PostgreSQL wire protocol
 
 =head1 VERSION
 
-version 0.005
+version 0.006
 
 =head1 SYNOPSIS
 

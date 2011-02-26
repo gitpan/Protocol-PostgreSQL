@@ -18,4 +18,5 @@ requires:
   POSIX: 0
   Time::HiRes: 0
   parent: 0
-version: 0.005
+  perl: 5.008
+version: 0.006

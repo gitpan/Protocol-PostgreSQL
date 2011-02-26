@@ -3,7 +3,7 @@ package Protocol::PostgreSQL;
 use strict;
 use warnings;
 
-our $VERSION = '0.005';
+our $VERSION = '0.006';
 
 =head1 NAME
 
@@ -11,7 +11,7 @@ Protocol::PostgreSQL - support for the PostgreSQL wire protocol
 
 =head1 VERSION
 
-version 0.005
+version 0.006
 
 =head1 SYNOPSIS
 
@@ -141,6 +141,48 @@ use Protocol::PostgreSQL::Statement;
 # Currently v3.0, which is used in PostgreSQL 7.4+
 use constant PROTOCOL_VERSION	=> 0x00030000;
 
+# Currently-allowed list of callbacks (can be set via ->configure
+our @CALLBACKS_ALLOWED = qw(
+	on_send_request
+	on_authenticated
+	on_copy_data
+	on_copy_complete
+	on_request_ready
+	on_bind_complete
+	on_close_complete
+	on_command_complete
+	on_copy_in_response
+	on_copy_out_response
+	on_copy_both_response
+	on_data_row
+	on_empty_query
+	on_error
+	on_function_call_result
+	on_no_data
+	on_notice
+	on_notification
+	on_parameter_description
+	on_parameter_status
+	on_parse_complete
+	on_portal_suspended
+	on_ready_for_query
+	on_row_description
+	on_copy_fail
+	on_describe
+	on_execute
+	on_flush
+	on_function_call
+	on_parse
+	on_password
+	on_query
+	on_ssl_request
+	on_startup_message
+	on_sync
+	on_terminate
+);
+# Hash form for convenience
+my %CALLBACK_MAP = map { $_ => 1 } @CALLBACKS_ALLOWED;
+
 # Types of authentication response
 my %AUTH_TYPE = (
 	0	=> 'AuthenticationOk',
@@ -218,6 +260,7 @@ our %MESSAGE_TYPE_FRONTEND = (
 	Parse			=> 'P',
 	PasswordMessage		=> 'p',
 	Query			=> 'Q',
+# Both of these are handled separately
 #	SSLRequest		=> '',
 #	StartupMessage		=> '',
 	Sync			=> 'S',
@@ -250,7 +293,8 @@ our %FRONTEND_MESSAGE_BUILDER = (
 			$param,		# Actual parameter values
 			0		# Number of result column format definitions (0=use default text format)
 		);
-		$self->debug(
+		push @{$self->{pending_bind}}, $args{sth} if $args{sth};
+		$self->debug(sub {
 			join('',
 				"Bind",
 				defined($args{portal}) ? " for portal [" . $args{portal} . "]" : '',
@@ -258,7 +302,7 @@ our %FRONTEND_MESSAGE_BUILDER = (
 				" with $count parameter(s): ",
 				join(',', @{$args{param}})
 			)
-		);
+		});
 		return $self->_build_message(
 			type	=> 'Bind',
 			data	=> $msg,
@@ -289,6 +333,9 @@ our %FRONTEND_MESSAGE_BUILDER = (
 		return $self->_build_message(
 			type	=> 'Describe',
 			data	=> $msg,
+		) . $self->_build_message(
+			type	=> 'Query',
+			data	=> "\0"
 		);
 	},
 # Execute either a named or anonymous portal (prepared statement with bind vars)
@@ -310,7 +357,7 @@ our %FRONTEND_MESSAGE_BUILDER = (
 		my %args = @_;
 		die "No SQL provided" unless defined $args{sql};
 
-		my $msg = pack('Z*Z*n1', defined($args{statement}) ? $args{statement} : '', $args{sql}, 0);
+		my $msg = pack('Z*Z*n1', (defined($args{statement}) ? $args{statement} : ''), $args{sql}, 0);
 		return $self->_build_message(
 			type	=> 'Parse',
 			data	=> $msg,
@@ -440,6 +487,10 @@ our %BACKEND_MESSAGE_HANDLER = (
 		my $self = shift;
 		my $msg = shift;
 		(undef, my $size) = unpack('C1N1', $msg);
+		if(my $sth = shift(@{$self->{pending_bind}})) {
+			$self->debug("Pass over to statement $sth");
+			$sth->bind_complete;
+		}
 		$self->_event('bind_complete');
 	},
 # We have closed the connection to the server successfully
@@ -457,6 +508,7 @@ our %BACKEND_MESSAGE_HANDLER = (
 		if(@{$self->{pending_execute}}) {
 			my $last = shift @{$self->{pending_execute}};
 			$self->debug("Finished command for $last");
+			$last->command_complete if $last;
 		}
 		$self->_event('command_complete', result => $result);
 	},
@@ -481,7 +533,8 @@ our %BACKEND_MESSAGE_HANDLER = (
 		substr $msg, 0, 7, '';
 		my @fields;
 		# TODO Tidy this up
-		my $desc = @{$self->{pending_execute}} ? $self->{pending_execute}[0]->row_description : $self->row_description;
+		my $sth = @{$self->{pending_execute}} ? $self->{pending_execute}[0] : $self->active_statement;
+		my $desc = $sth ? $sth->row_description : $self->row_description;
 		foreach my $idx (0..$count-1) {
 			my $field = $desc->field_index($idx);
 			my ($size) = unpack('N1', $msg);
@@ -498,6 +551,7 @@ our %BACKEND_MESSAGE_HANDLER = (
 				data		=> $null ? undef : $data,
 			}
 		}
+		$sth->data_row(\@fields) if $sth;
 		$self->_event('data_row', row => \@fields);
 	},
 # Response given when empty query (whitespace only) is provided
@@ -509,7 +563,6 @@ our %BACKEND_MESSAGE_HANDLER = (
 			$self->debug("Finished command for $last");
 		}
 		$self->_event('empty_query');
-		$self->_event('ready_for_query');
 	},
 # An error occurred, can indicate that connection is about to close or just be a warning
 	ErrorResponse => sub {
@@ -610,6 +663,7 @@ our %BACKEND_MESSAGE_HANDLER = (
 		my $self = shift;
 		my $msg = shift;
 		(undef, my $size) = unpack('C1N1', $msg);
+		$self->active_statement->parse_complete if $self->active_statement;
 		$self->_event('parse_complete');
 	},
 # Portal has sent enough data to meet the row limit, should be requested again if more is required
@@ -630,6 +684,8 @@ our %BACKEND_MESSAGE_HANDLER = (
 		my (undef, undef, $state) = unpack('C1N1A1', $msg);
 		$self->debug("Backend state is $state");
 		$self->backend_state($BACKEND_STATE{$state});
+		$self->is_ready(1);
+		return $self->send_next_in_queue if $self->has_queued;
 		$self->_event('ready_for_query');
 	},
 # Information on the row data that's expected to follow
@@ -669,27 +725,63 @@ our %BACKEND_MESSAGE_HANDLER = (
 
 =head2 new
 
-Instantiate a new object.
+Instantiate a new object. Blesses an empty hashref and calls L</configure>, subclasses can bypass this entirely
+and just call L</configure> directly after instantiation.
 
 =cut
 
 sub new {
 	my $self = bless {
 	}, shift;
-	$self->init(@_);
+	$self->configure(@_);
 }
 
-sub init {
+=head2 configure
+
+Does the real preparation for the object.
+
+Takes callbacks as named parameters, including:
+
+=over 4
+
+=item * on_error
+
+=item * on_data_row
+
+=item * on_ready_for_query
+
+=back
+
+=cut
+
+sub configure {
 	my $self = shift;
 	my %args = @_;
-	$self->{pending_execute} = [];
-	$self->{pending_describe} = [];
-	$self->{authenticated} = 0;
-	$self->{message_count} = 0;
-	$self->{debug} = 1 if delete $args{debug};
-	$self->{_callback}->{$_} = $args{$_} for grep /^on_/, keys %args;
+
+# Init parameters - should only be needed on first call
+	$self->{pending_execute} = [] unless exists $self->{pending_execute};
+	$self->{pending_describe} = [] unless exists $self->{pending_describe};
+	$self->{message_queue} = [] unless exists $self->{message_queue};
+	$self->{authenticated} = 0 unless exists $self->{authenticated};
+	$self->{message_count} = 0 unless exists $self->{message_count};
+
+	$self->{debug} = delete $args{debug} ? 1 : 0 if exists $args{debug};
+
+# Callbacks
+	for (grep /^on_/, keys %args) {
+		die "Unknown callback '$_'" unless exists $CALLBACK_MAP{$_};
+		$self->{_callback}->{$_} = $args{$_};
+	}
 	return $self;
 }
+
+=head2 has_queued
+
+Returns number of queued messages.
+
+=cut
+
+sub has_queued { scalar(@{$_[0]->{message_queue}}) }
 
 =head2 is_authenticated
 
@@ -703,13 +795,16 @@ sub is_authenticated { shift->{authenticated} ? 1 : 0 }
 
 Returns true if this is the first message, as per L<http://developer.postgresql.org/pgdocs/postgres/protocol-overview.html>:
 
- "For historical reasons, the very first message sent by the client (the startup message) has no initial message-type byte."
+ "For historical reasons, the very first message sent by the client (the startup message)
+  has no initial message-type byte."
 
 =cut
 
 sub is_first_message { shift->{message_count} < 1 }
 
 =head2 initial_request
+
+Generate and send the startup request.
 
 =cut
 
@@ -726,11 +821,84 @@ sub initial_request {
 
 =head2 send_message
 
+Send a message.
+
 =cut
 
 sub send_message {
 	my $self = shift;
-	$self->_event('send_request', $self->message(@_));
+
+# Clear the ready-to-send flag since we're about to throw a message over to the
+# server and we don't want any others getting in the way.
+	$self->{is_ready} = 0;
+
+	my $msg = $self->message(@_);
+	die "Empty message?" unless defined $msg;
+
+# Use the coderef form of the debug call since the packet breakdown is a slow operation.
+	$self->debug(sub {
+		"send data: [" .
+		join(" ", map sprintf("%02x", ord($_)), split //, $msg) . "], " .
+		($self->is_first_message ? "startup packet" : $FRONTEND_MESSAGE_CODE{substr($msg, 0, 1)}) .  " (" . 
+		join("", grep { /^([a-z0-9,()_ -])$/ } split //, $msg) . ")"
+	});
+	$self->_event('send_request', $msg);
+	return $self;
+}
+
+=head2 queue
+
+Queue up a message for sending. The message will only be sent when we're in ReadyForQuery
+mode, which could be immediately or later.
+
+=cut
+
+sub queue {
+	my $self = shift;
+	my %args = @_;
+
+# Get raw message data to send, could be passed as a ready-built message packet or a set of parameters.
+	my $msg = delete $args{message};
+	unless($msg) {
+		# Might get a message with no parameters
+		$args{parameters} ||= [];
+		$msg = $self->message(delete $args{type}, @{ delete $args{parameters} });
+	}
+
+# Add this to the queue
+	push @{$self->{message_queue}}, {
+		message	=> $msg,
+		%args
+	};
+
+# Send immediately if we're in a ready state
+	$self->send_next_in_queue if $self->is_ready;
+	return $self;
+}
+
+=head2 send_next_in_queue
+
+Send the next queued message.
+
+=cut
+
+sub send_next_in_queue {
+	my $self = shift;
+
+# TODO Clean up the duplication between this method and L</send_message>.
+	if(my $info = shift @{$self->{message_queue}}) {
+		my $msg = delete $info->{message};
+
+# Clear flag so we only send a single message rather than hammering the server with everything in the queue
+		$self->{is_ready} = 0;
+		$self->debug(sub {
+			"send data: [" . join(" ", map sprintf("%02x", ord($_)), split //, $msg) . "], " . $FRONTEND_MESSAGE_CODE{substr($msg, 0, 1)} . " (" . join("", grep { /^([a-z0-9,()_ -])$/ } split //, $msg) . ")"
+		});
+		$self->_event('send_request', $msg);
+
+# Ping the callback to let it know message is now in flight
+		$info->{callback}->($self, $info) if exists $info->{callback};
+	}
 	return $self;
 }
 
@@ -744,8 +912,8 @@ sub message {
 	my $self = shift;
 	my $type = shift;
 	die "Message $type unknown" unless exists $FRONTEND_MESSAGE_BUILDER{$type};
+
 	my $msg = $FRONTEND_MESSAGE_BUILDER{$type}->($self, @_);
-	$self->debug("send data: [" . join(" ", map sprintf("%02x", ord($_)), split //, $msg) . "]");
 	++$self->{message_count};
 	return $msg;
 }
@@ -759,43 +927,59 @@ Attach new handler(s) to the given event(s).
 sub attach_event {
 	my $self = shift;
 	my %args = @_;
-	$self->{_callback}->{"on_$_"} = $args{$_} for keys %args;
+	for (keys %args) {
+		my $k = "on_$_";
+		die "Unknown callback '$_'" unless exists $CALLBACK_MAP{$k};
+		$self->{_callback}->{$k} = $args{$_};
+	}
 	return $self;
 }
 
 =head2 debug
 
-Helper method to report debug information.
+Helper method to report debug information. Can take a string or a coderef.
 
 =cut
 
 sub debug {
 	my $self = shift;
-	return $self unless $self->{debug};
+	return unless $self->{debug};
+
+	my $msg = shift(@_);
+	$msg = $msg->() if ref $msg && ref $msg eq 'CODE';
 	if(!ref $self->{debug}) {
 		my $now = Time::HiRes::time;
 		warn strftime("%Y-%m-%d %H:%M:%S", gmtime($now)) . sprintf(".%03d", int($now * 1000.0) % 1000.0) . " @_\n";
-		return $self;
+		return;
 	}
 	if(ref $self->{debug} eq 'CODE') {
 		$self->{debug}->(@_);
-		return $self;
+		return;
 	}
 	die "Unknown debug setting " . $self->{debug};
 }
 
 =head2 handle_message
 
+Handle an incoming message from the server.
+
 =cut
 
 sub handle_message {
 	my $self = shift;
 	my $msg = shift;
-	$self->debug("recv data: [" . join(" ", map sprintf("%02x", ord($_)), split //, $msg) . "]");
+	$self->debug(sub {
+		"recv data: [" . join(" ", map sprintf("%02x", ord($_)), split //, $msg) . "], " . $BACKEND_MESSAGE_CODE{substr($msg, 0, 1)}
+	});
+
+# Extract code and identify which message handler to use
 	my $code = substr $msg, 0, 1;
 	my $type = $BACKEND_MESSAGE_CODE{$code};
-	$self->debug("Handle [$type] message");
+	$self->debug("Handle     [$type] message");
 	die "No handler for $type" unless exists $BACKEND_MESSAGE_HANDLER{$type};
+
+# Clear the ready-to-send flag until we've processed this
+	$self->{is_ready} = 0;
 	return $BACKEND_MESSAGE_HANDLER{$type}->($self, $msg);
 }
 
@@ -823,8 +1007,11 @@ sub simple_query {
 	my $self = shift;
 	my $sql = shift;
 	die "Invalid backend state" if $self->backend_state eq 'error';
+
 	$self->debug("Running query [$sql]");
-	$self->send_message('Query', sql => $sql);
+	$self->queue(
+		message	=> $self->message('Query', sql => $sql)
+	);
 	return $self;
 }
 
@@ -838,6 +1025,7 @@ sub copy_data {
 	my $self = shift;
 	my $data = shift;
 	die "Invalid backend state" if $self->backend_state eq 'error';
+
 	$self->send_message('CopyData', data => $data);
 	return $self;
 }
@@ -852,6 +1040,7 @@ sub copy_done {
 	my $self = shift;
 	my $data = shift;
 	die "Invalid backend state" if $self->backend_state eq 'error';
+
 	$self->send_message('CopyDone');
 	return $self;
 }
@@ -867,13 +1056,16 @@ sub backend_state {
 	if(@_) {
 		my $state = shift;
 		die "bad state code" unless grep { $state eq $_ } qw(idle transaction error);
+
 		$self->{backend_state} = $state;
 		return $self;
 	}
 	return $self->{backend_state};
 }
 
-=head2 C<active_statement>
+=head2 active_statement
+
+Returns the currently active L<Protocol::PostgreSQL::Statement> if we have one.
 
 =cut
 
@@ -901,11 +1093,24 @@ sub row_description {
 	return $self->{row_description};
 }
 
+=head2 prepare
+
+Prepare a L<Protocol::PostgreSQL::Statement>. Intended to be mostly compatible with the L<DBI>
+->prepare method.
+
+=cut
+
 sub prepare {
 	my $self = shift;
 	my $sql = shift;
 	return $self->prepare_async(sql => $sql);
 }
+
+=head2 prepare_async
+
+Set up a L<Protocol::PostgreSQL::Statement> allowing callbacks and other options to be provided.
+
+=cut
 
 sub prepare_async {
 	my $self = shift;
@@ -919,19 +1124,40 @@ sub prepare_async {
 	return $sth;
 }
 
-sub send_copy_data {
+=head2 is_ready
+
+Returns true if we're ready to send more data to the server.
+
+=cut
+
+sub is_ready {
+	my $self = shift;
+	if(@_) {
+		$self->{is_ready} = shift;
+		return $self;
+	}
+	return $self->{is_ready};
+}
+
+=head2 send_copy_data
+
+Send COPY data to the server. Takes an arrayref and replaces any reserved characters with quoted versions.
+
+=cut
+
+sub send_copy_data  {
 	my $self = shift;
 	my $data = shift;
 	my @out;
 	foreach (@$data) {
 		my $v = $_;
 		if(defined $v) {
-			$v =~ s/\\/\\\\/g;
-			$v =~ s/\x08/\\b/g;
-			$v =~ s/\f/\\f/g;
-			$v =~ s/\n/\\n/g;
-			$v =~ s/\t/\\t/g;
-			$v =~ s/\v/\\v/g;
+			$v =~ s/\\/\\\\/g if index($v, "\\") >= 0;
+			$v =~ s/\x08/\\b/g if index($v, "\x08") >= 0;
+			$v =~ s/\f/\\f/g if index($v, "\f") >= 0;
+			$v =~ s/\n/\\n/g if index($v, "\n") >= 0;
+			$v =~ s/\t/\\t/g if index($v, "\t") >= 0;
+			$v =~ s/\v/\\v/g if index($v, "\r") >= 0;
 		} else {
 			$v = '\N';
 		}
@@ -950,9 +1176,10 @@ sub _event {
 	my $self = shift;
 	my $type = shift;
 	$type = "on_$type";
-	my $code = $self->{_callback}->{$type} || $self->can($type);
-#	$self->debug("Had $type with $code");
-	$code->($self, @_) if $code;
+	my $code = $self->{_callback}->{$type} || $self->can($type)
+		or return $self;
+
+	$code->($self, @_);
 	return $self;
 }
 
@@ -972,7 +1199,8 @@ sub _build_message {
 
 # Length includes the 4-byte length field, but not the type byte
 	my $length = length($args{data}) + 4;
-	return ($self->is_first_message ? '' : $MESSAGE_TYPE_FRONTEND{$args{type}}) . pack('N1', $length) . $args{data};
+	my $msg = ($self->is_first_message ? '' : $MESSAGE_TYPE_FRONTEND{$args{type}}) . pack('N1', $length) . $args{data};
+	return $msg;
 }
 
 1;

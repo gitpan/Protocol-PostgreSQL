@@ -13,7 +13,7 @@ sub is_hex($$$) {
 
 my @messages;
 my $pg = new_ok('Protocol::PostgreSQL' => [
-	on_outgoing => sub {
+	on_send_request => sub {
 		push @messages, @_;
 	}
 ]);
