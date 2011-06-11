@@ -3,7 +3,7 @@ package Protocol::PostgreSQL;
 use strict;
 use warnings;
 
-our $VERSION = '0.006';
+our $VERSION = '0.007';
 
 =head1 NAME
 
@@ -11,7 +11,7 @@ Protocol::PostgreSQL - support for the PostgreSQL wire protocol
 
 =head1 VERSION
 
-version 0.006
+version 0.007
 
 =head1 SYNOPSIS
 
@@ -316,6 +316,13 @@ our %FRONTEND_MESSAGE_BUILDER = (
 			data	=> pack('a*', $args{data})
 		);
 	},
+	Close => sub {
+		my $self = shift;
+		return $self->_build_message(
+			type	=> 'Close',
+			data	=> '',
+		);
+	},
 	CopyDone => sub {
 		my $self = shift;
 		return $self->_build_message(
@@ -414,6 +421,13 @@ our %FRONTEND_MESSAGE_BUILDER = (
 		my $self = shift;
 		return $self->_build_message(
 			type	=> 'Sync',
+			data	=> '',
+		);
+	},
+	Terminate => sub {
+		my $self = shift;
+		return $self->_build_message(
+			type	=> 'Terminate',
 			data	=> '',
 		);
 	},
@@ -861,8 +875,7 @@ sub queue {
 	my $msg = delete $args{message};
 	unless($msg) {
 		# Might get a message with no parameters
-		$args{parameters} ||= [];
-		$msg = $self->message(delete $args{type}, @{ delete $args{parameters} });
+		$msg = $self->message(delete $args{type}, @{ delete $args{parameters} || [] });
 	}
 
 # Add this to the queue
@@ -935,6 +948,22 @@ sub attach_event {
 	return $self;
 }
 
+=head2 detach_event
+
+Detach handler(s) from the given event(s).
+
+=cut
+
+sub detach_event {
+	my $self = shift;
+	for (@_) {
+		my $k = "on_$_";
+		die "Unknown callback '$_'" unless exists $CALLBACK_MAP{$k};
+		delete $self->{_callback}->{$k};
+	}
+	return $self;
+}
+
 =head2 debug
 
 Helper method to report debug information. Can take a string or a coderef.
@@ -953,7 +982,7 @@ sub debug {
 		return;
 	}
 	if(ref $self->{debug} eq 'CODE') {
-		$self->{debug}->(@_);
+		$self->{debug}->($msg, @_);
 		return;
 	}
 	die "Unknown debug setting " . $self->{debug};
@@ -1026,7 +1055,9 @@ sub copy_data {
 	my $data = shift;
 	die "Invalid backend state" if $self->backend_state eq 'error';
 
-	$self->send_message('CopyData', data => $data);
+	$self->queue(
+		message	=> $self->message('CopyData', data => $data)
+	);
 	return $self;
 }
 
@@ -1148,22 +1179,22 @@ Send COPY data to the server. Takes an arrayref and replaces any reserved charac
 sub send_copy_data  {
 	my $self = shift;
 	my $data = shift;
-	my @out;
-	foreach (@$data) {
-		my $v = $_;
-		if(defined $v) {
-			$v =~ s/\\/\\\\/g if index($v, "\\") >= 0;
-			$v =~ s/\x08/\\b/g if index($v, "\x08") >= 0;
-			$v =~ s/\f/\\f/g if index($v, "\f") >= 0;
-			$v =~ s/\n/\\n/g if index($v, "\n") >= 0;
-			$v =~ s/\t/\\t/g if index($v, "\t") >= 0;
-			$v =~ s/\v/\\v/g if index($v, "\r") >= 0;
+	my $content = pack 'a*', (join("\t", map {
+		if(defined) {
+			s/\\/\\\\/g if index($_, "\\") >= 0;
+			s/\x08/\\b/g if index($_, "\x08") >= 0;
+			s/\f/\\f/g if index($_, "\f") >= 0;
+			s/\n/\\n/g if index($_, "\n") >= 0;
+			s/\t/\\t/g if index($_, "\t") >= 0;
+			s/\v/\\v/g if index($_, "\r") >= 0;
 		} else {
-			$v = '\N';
+			$_ = '\N';
 		}
-		push @out, $v;
-	}
-	$self->copy_data(join("\t", @out) . "\n");
+		$_;
+	} @$data) . "\n");
+	
+	$self->_event('send_request', $MESSAGE_TYPE_FRONTEND{'CopyData'} . pack('N1', 4 + length $content) . $content);
+	return $self;
 }
 
 =head2 _event

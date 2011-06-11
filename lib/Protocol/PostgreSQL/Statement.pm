@@ -1,6 +1,6 @@
 package Protocol::PostgreSQL::Statement;
 BEGIN {
-  $Protocol::PostgreSQL::Statement::VERSION = '0.006';
+  $Protocol::PostgreSQL::Statement::VERSION = '0.007';
 }
 use strict;
 use warnings;
@@ -13,7 +13,7 @@ Protocol::PostgreSQL::Statement - prepared statement handling
 
 =head1 VERSION
 
-version 0.006
+version 0.007
 
 =head1 SYNOPSIS
 
@@ -115,6 +115,7 @@ sub new {
 		bind_pending	=> [],
 		execute_pending	=> [],
 	}, $class;
+	$self->{on_ready} = delete $args{on_ready} if exists $args{on_ready};
 
 # We queue an initial Parse request. When we get around to sending it, we'll push a describe over as well.
 	$self->dbh->queue(
@@ -319,6 +320,8 @@ sub on_ready {
 				$self->_execute;
 			})
 		);
+	} else {
+		$self->{on_ready}->() if exists $self->{on_ready};
 	}
 }
 

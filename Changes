@@ -1,3 +1,7 @@
+0.007     2011-06-11 17:38:59 Europe/London
+	Included some extra callbacks for statements so that we know when it's safe to send data, and provide
+	support for the terminate/close requests so we disconnect cleanly.
+
 0.006     2011-02-26 18:55:27 Europe/London
 	More support for COPY IN, interleaved prepared statements and callbacks for data_row / no_data conditions.
 	Improved performance slightly by moving some slow debug handling into coderefs.
