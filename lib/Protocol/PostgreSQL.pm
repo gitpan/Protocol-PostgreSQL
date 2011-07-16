@@ -2,8 +2,9 @@ package Protocol::PostgreSQL;
 # ABSTRACT: PostgreSQL wire protocol
 use strict;
 use warnings;
+use parent qw(Mixin::Event::Dispatch);
 
-our $VERSION = '0.007';
+our $VERSION = '0.008';
 
 =head1 NAME
 
@@ -11,7 +12,7 @@ Protocol::PostgreSQL - support for the PostgreSQL wire protocol
 
 =head1 VERSION
 
-version 0.007
+version 0.008
 
 =head1 SYNOPSIS
 
@@ -141,7 +142,7 @@ use Protocol::PostgreSQL::Statement;
 # Currently v3.0, which is used in PostgreSQL 7.4+
 use constant PROTOCOL_VERSION	=> 0x00030000;
 
-# Currently-allowed list of callbacks (can be set via ->configure
+# Currently-allowed list of callbacks (can be set via ->configure)
 our @CALLBACKS_ALLOWED = qw(
 	on_send_request
 	on_authenticated
@@ -318,9 +319,21 @@ our %FRONTEND_MESSAGE_BUILDER = (
 	},
 	Close => sub {
 		my $self = shift;
+		my %args = @_;
+
+		my $msg = pack('a1Z*',
+			exists $args{portal} ? 'P' : 'S', # close a portal or a statement
+			  defined($args{statement})
+			? $args{statement}
+			:  (defined($args{portal})
+			  ? $args{portal}
+			  : ''
+			)
+		);
+		push @{$self->{pending_close}}, $args{on_complete} if $args{on_complete};
 		return $self->_build_message(
 			type	=> 'Close',
-			data	=> '',
+			data	=> $msg,
 		);
 	},
 	CopyDone => sub {
@@ -437,8 +450,9 @@ our %FRONTEND_MESSAGE_BUILDER = (
 my %AUTH_HANDLER = (
 	AuthenticationOk => sub {
 		my ($self, $msg) = @_;
-		$self->_event('authenticated');
-		$self->_event('request_ready');
+		$self->invoke_event('authenticated');
+		$self->invoke_event('request_ready');
+		return $self;
 	},
 	AuthenticationKerberosV5 => sub {
 		my ($self, $msg) = @_;
@@ -447,18 +461,21 @@ my %AUTH_HANDLER = (
 	AuthenticationCleartextPassword => sub {
 		my ($self, $msg) = @_;
 		$self->{password_type} = 'plain';
-		$self->_event('password');
+		$self->invoke_event('password');
+		return $self;
 	},
 	AuthenticationMD5Password => sub {
 		my ($self, $msg) = @_;
 		(undef, undef, undef, my $salt) = unpack('C1N1N1a4', $msg);
 		$self->{password_type} = 'md5';
 		$self->{password_salt} = $salt;
-		$self->_event('password');
+		$self->invoke_event('password');
+		return $self;
 	},
 	AuthenticationSCMCredential => sub {
 		my ($self, $msg) = @_;
 		die "Not yet implemented";
+		return $self;
 	},
 	AuthenticationGSS => sub {
 		my ($self, $msg) = @_;
@@ -491,10 +508,11 @@ our %BACKEND_MESSAGE_HANDLER = (
 		my $self = shift;
 		my $msg = shift;
 		(undef, my $size, my $pid, my $key) = unpack('C1N1N1N1', $msg);
-		$self->_event('backendkeydata',
+		$self->invoke_event('backendkeydata',
 			pid	=> $pid,
 			key	=> $key
 		);
+		return $self;
 	},
 # A bind operation has completed
 	BindComplete	=> sub {
@@ -505,14 +523,21 @@ our %BACKEND_MESSAGE_HANDLER = (
 			$self->debug("Pass over to statement $sth");
 			$sth->bind_complete;
 		}
-		$self->_event('bind_complete');
+		$self->invoke_event('bind_complete');
+		return $self;
 	},
 # We have closed the connection to the server successfully
 	CloseComplete	=> sub {
 		my $self = shift;
 		my $msg = shift;
 		(undef, my $size) = unpack('C1N1', $msg);
-		$self->_event('close_complete');
+
+		# Handler could be undef - we always push something to keep things symmetrical
+		if(my $handler = shift @{$self->{pending_close}}) {
+			$handler->($self);
+		}
+		$self->invoke_event('close_complete');
+		return $self;
 	},
 # A command has completed, we should see a ready response immediately after this
 	CommandComplete => sub {
@@ -524,7 +549,8 @@ our %BACKEND_MESSAGE_HANDLER = (
 			$self->debug("Finished command for $last");
 			$last->command_complete if $last;
 		}
-		$self->_event('command_complete', result => $result);
+		$self->invoke_event('command_complete', result => $result);
+		return $self;
 	},
 # We have a COPY response from the server indicating that it's ready to accept COPY data
 	CopyInResponse => sub {
@@ -537,7 +563,8 @@ our %BACKEND_MESSAGE_HANDLER = (
 			push @formats, unpack('n1', $msg);
 			substr $msg, 0, 2, '';
 		}
-		$self->_event('copy_in_response', count => $count, columns => \@formats);
+		$self->invoke_event('copy_in_response', count => $count, columns => \@formats);
+		return $self;
 	},
 # The basic SQL result - a single row of data
 	DataRow => sub {
@@ -566,7 +593,8 @@ our %BACKEND_MESSAGE_HANDLER = (
 			}
 		}
 		$sth->data_row(\@fields) if $sth;
-		$self->_event('data_row', row => \@fields);
+		$self->invoke_event('data_row', row => \@fields);
+		return $self;
 	},
 # Response given when empty query (whitespace only) is provided
 	EmptyQueryResponse => sub {
@@ -576,7 +604,8 @@ our %BACKEND_MESSAGE_HANDLER = (
 			my $last = shift @{$self->{pending_execute}};
 			$self->debug("Finished command for $last");
 		}
-		$self->_event('empty_query');
+		$self->invoke_event('empty_query');
+		return $self;
 	},
 # An error occurred, can indicate that connection is about to close or just be a warning
 	ErrorResponse => sub {
@@ -598,7 +627,8 @@ our %BACKEND_MESSAGE_HANDLER = (
 			my $last = shift @{$self->{pending_execute}};
 			$self->debug("Error for $last");
 		}
-		$self->_event('error', error => \%notice);
+		$self->invoke_event('error', error => \%notice);
+		return $self;
 	},
 # Result from calling a function
 	FunctionCallResponse	=> sub {
@@ -607,14 +637,16 @@ our %BACKEND_MESSAGE_HANDLER = (
 		(undef, my $size, my $len) = unpack('C1N1N1', $msg);
 		substr $msg, 0, 9, '';
 		my $data = ($len == 0xFFFFFFFF) ? undef : substr $msg, 0, $len;
-		$self->_event('function_call_response', data => $data);
+		$self->invoke_event('function_call_response', data => $data);
+		return $self;
 	},
 # No data follows
 	NoData	=> sub {
 		my $self = shift;
 		my $msg = shift;
 		(undef, my $size) = unpack('C1N1', $msg);
-		$self->_event('no_data');
+		$self->invoke_event('no_data');
+		return $self;
 	},
 # We have a notice, which is like an error but can be just informational
 	NoticeResponse => sub {
@@ -632,14 +664,16 @@ our %BACKEND_MESSAGE_HANDLER = (
 			$notice{$NOTICE_CODE{$code}} = $str;
 			substr $msg, 0, 2+length($str), '';
 		}
-		$self->_event('notice', notice => \%notice);
+		$self->invoke_event('notice', notice => \%notice);
+		return $self;
 	},
 # LISTEN/NOTIFY mechanism
 	NotificationReponse => sub {
 		my $self = shift;
 		my $msg = shift;
 		(undef, my $size, my $pid, my $channel, my $data) = unpack('C1N1N1Z*Z*', $msg);
-		$self->_event('notification', pid => $pid, channel => $channel, data => $data);
+		$self->invoke_event('notification', pid => $pid, channel => $channel, data => $data);
+		return $self;
 	},
 # Connection parameter information
 	ParameterStatus	=> sub {
@@ -656,7 +690,8 @@ our %BACKEND_MESSAGE_HANDLER = (
 			$status{$k} = $v;
 			substr $msg, 0, length($k) + length($v) + 2, '';
 		}
-		$self->_event('parameter_status', status => \%status);
+		$self->invoke_event('parameter_status', status => \%status);
+		return $self;
 	},
 # Description of the format that subsequent parameters are using, typically plaintext only
 	ParameterDescription => sub {
@@ -670,7 +705,8 @@ our %BACKEND_MESSAGE_HANDLER = (
 			substr $msg, 0, 4, '';
 			push @oid_list, $oid;
 		}
-		$self->_event('parameter_description', parameters => \@oid_list);
+		$self->invoke_event('parameter_description', parameters => \@oid_list);
+		return $self;
 	},
 # Parse request succeeded
 	ParseComplete	=> sub {
@@ -678,7 +714,8 @@ our %BACKEND_MESSAGE_HANDLER = (
 		my $msg = shift;
 		(undef, my $size) = unpack('C1N1', $msg);
 		$self->active_statement->parse_complete if $self->active_statement;
-		$self->_event('parse_complete');
+		$self->invoke_event('parse_complete');
+		return $self;
 	},
 # Portal has sent enough data to meet the row limit, should be requested again if more is required
 	PortalSuspended	=> sub {
@@ -689,7 +726,8 @@ our %BACKEND_MESSAGE_HANDLER = (
 			my $last = shift @{$self->{pending_execute}};
 			$self->debug("Suspended portal for $last");
 		}
-		$self->_event('portal_suspended');
+		$self->invoke_event('portal_suspended');
+		return $self;
 	},
 # All ready to accept queries
 	ReadyForQuery	=> sub {
@@ -700,7 +738,8 @@ our %BACKEND_MESSAGE_HANDLER = (
 		$self->backend_state($BACKEND_STATE{$state});
 		$self->is_ready(1);
 		return $self->send_next_in_queue if $self->has_queued;
-		$self->_event('ready_for_query');
+		$self->invoke_event('ready_for_query');
+		return $self;
 	},
 # Information on the row data that's expected to follow
 	RowDescription => sub {
@@ -729,7 +768,8 @@ our %BACKEND_MESSAGE_HANDLER = (
 		if(my $last = shift @{$self->{pending_describe}}) {
 			$last->row_description($row);
 		}
-		$self->_event('row_description', description => $row);
+		$self->invoke_event('row_description', description => $row);
+		return $self;
 	},
 );
 
@@ -748,6 +788,7 @@ sub new {
 	my $self = bless {
 	}, shift;
 	$self->configure(@_);
+	return $self;
 }
 
 =head2 configure
@@ -773,20 +814,23 @@ sub configure {
 	my %args = @_;
 
 # Init parameters - should only be needed on first call
-	$self->{pending_execute} = [] unless exists $self->{pending_execute};
-	$self->{pending_describe} = [] unless exists $self->{pending_describe};
-	$self->{message_queue} = [] unless exists $self->{message_queue};
-	$self->{authenticated} = 0 unless exists $self->{authenticated};
-	$self->{message_count} = 0 unless exists $self->{message_count};
+	$self->{$_} = [] for grep !exists $self->{$_}, qw(pending_execute pending_describe message_queue);
+	$self->{$_} = 0 for grep !exists $self->{$_}, qw(authenticated message_count);
+	$self->{wait_for_startup} = 1 unless exists $self->{wait_for_startup};
 
-	$self->{debug} = delete $args{debug} ? 1 : 0 if exists $args{debug};
+	$self->{debug} = delete $args{debug} if exists $args{debug};
+
+	$self->{user} = delete $args{user} if exists $args{user};
+	$self->{pass} = delete $args{pass} if exists $args{pass};
+	$self->{database} = delete $args{database} if exists $args{database};
 
 # Callbacks
-	for (grep /^on_/, keys %args) {
-		die "Unknown callback '$_'" unless exists $CALLBACK_MAP{$_};
-		$self->{_callback}->{$_} = $args{$_};
+	foreach my $k (grep /on_(.+)$/, keys %args) {
+		my ($event) = $k =~ /on_(.+)$/;
+		die "Unknown callback '$k'" unless exists $CALLBACK_MAP{$k};
+		$self->add_handler_for_event($event => delete $args{$k});
 	}
-	return $self;
+	return %args;
 }
 
 =head2 has_queued
@@ -830,6 +874,7 @@ sub initial_request {
 	die "don't know how to handle " . join(',', keys %args) if keys %args;
 
 	$self->send_message('StartupMessage', %param);
+	$self->{wait_for_startup} = 0;
 	return $self;
 }
 
@@ -853,10 +898,10 @@ sub send_message {
 	$self->debug(sub {
 		"send data: [" .
 		join(" ", map sprintf("%02x", ord($_)), split //, $msg) . "], " .
-		($self->is_first_message ? "startup packet" : $FRONTEND_MESSAGE_CODE{substr($msg, 0, 1)}) .  " (" . 
-		join("", grep { /^([a-z0-9,()_ -])$/ } split //, $msg) . ")"
+		(($self->is_first_message ? "startup packet" : $FRONTEND_MESSAGE_CODE{substr($msg, 0, 1)}) || 'unknown message') .  " (" . 
+		join('', '', map { (my $txt = defined($_) ? $_ : '') =~ tr/ []"'!#$%*&=:;A-Za-z0-9,()_ -/./c; $txt } split //, $msg) . ")"
 	});
-	$self->_event('send_request', $msg);
+	$self->invoke_event('send_request', $msg);
 	return $self;
 }
 
@@ -907,7 +952,7 @@ sub send_next_in_queue {
 		$self->debug(sub {
 			"send data: [" . join(" ", map sprintf("%02x", ord($_)), split //, $msg) . "], " . $FRONTEND_MESSAGE_CODE{substr($msg, 0, 1)} . " (" . join("", grep { /^([a-z0-9,()_ -])$/ } split //, $msg) . ")"
 		});
-		$self->_event('send_request', $msg);
+		$self->invoke_event('send_request', $msg);
 
 # Ping the callback to let it know message is now in flight
 		$info->{callback}->($self, $info) if exists $info->{callback};
@@ -940,6 +985,10 @@ Attach new handler(s) to the given event(s).
 sub attach_event {
 	my $self = shift;
 	my %args = @_;
+	$self->debug("Using old ->attach_event interface, suggest ->add_handler_for_event from Mixin::Event::Dispatch instead for %s", join(',', keys %args));
+	$self->add_handler_for_event(
+		map { $_ => sub { $args{$_}->(@_); 1 } } keys %args
+	);
 	for (keys %args) {
 		my $k = "on_$_";
 		die "Unknown callback '$_'" unless exists $CALLBACK_MAP{$k};
@@ -950,17 +999,13 @@ sub attach_event {
 
 =head2 detach_event
 
-Detach handler(s) from the given event(s).
+Detach handler(s) from the given event(s). Not implemented.
 
 =cut
 
 sub detach_event {
 	my $self = shift;
-	for (@_) {
-		my $k = "on_$_";
-		die "Unknown callback '$_'" unless exists $CALLBACK_MAP{$k};
-		delete $self->{_callback}->{$k};
-	}
+	warn "detach_event not implemented, see ->add_handler_for_event in Mixin::Event::Dispatch";
 	return $self;
 }
 
@@ -978,7 +1023,7 @@ sub debug {
 	$msg = $msg->() if ref $msg && ref $msg eq 'CODE';
 	if(!ref $self->{debug}) {
 		my $now = Time::HiRes::time;
-		warn strftime("%Y-%m-%d %H:%M:%S", gmtime($now)) . sprintf(".%03d", int($now * 1000.0) % 1000.0) . " @_\n";
+		warn strftime("%Y-%m-%d %H:%M:%S", gmtime($now)) . sprintf(".%03d", int($now * 1000.0) % 1000.0) . " $msg\n";
 		return;
 	}
 	if(ref $self->{debug} eq 'CODE') {
@@ -1055,9 +1100,7 @@ sub copy_data {
 	my $data = shift;
 	die "Invalid backend state" if $self->backend_state eq 'error';
 
-	$self->queue(
-		message	=> $self->message('CopyData', data => $data)
-	);
+	$self->send_message('CopyData', data => $data);
 	return $self;
 }
 
@@ -1167,6 +1210,7 @@ sub is_ready {
 		$self->{is_ready} = shift;
 		return $self;
 	}
+	return 0 if $self->{wait_for_startup};
 	return $self->{is_ready};
 }
 
@@ -1193,24 +1237,7 @@ sub send_copy_data  {
 		$_;
 	} @$data) . "\n");
 	
-	$self->_event('send_request', $MESSAGE_TYPE_FRONTEND{'CopyData'} . pack('N1', 4 + length $content) . $content);
-	return $self;
-}
-
-=head2 _event
-
-Calls the given event callback if we have one.
-
-=cut
-
-sub _event {
-	my $self = shift;
-	my $type = shift;
-	$type = "on_$type";
-	my $code = $self->{_callback}->{$type} || $self->can($type)
-		or return $self;
-
-	$code->($self, @_);
+	$self->invoke_event('send_request', $MESSAGE_TYPE_FRONTEND{'CopyData'} . pack('N1', 4 + length $content) . $content);
 	return $self;
 }
 

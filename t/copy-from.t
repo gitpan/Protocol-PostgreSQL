@@ -44,7 +44,7 @@ undef $row_desc;
 undef $data_row;
 my $copy_in;
 is(@queue, 0, 'queue is empty');
-ok($pg->attach_event('copy_in_response' => sub {
+ok($pg->add_handler_for_event('copy_in_response' => sub {
 	my ($self) = shift;
 	die "already seen" if $copy_in;
 	$copy_in = { @_ };

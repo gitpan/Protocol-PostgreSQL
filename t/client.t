@@ -39,7 +39,7 @@ is_hex($msg, '00 00 00 17 00 03 00 00 75 73 65 72 00 74 65 73 74 75 73 65 72 00 
 
 # Plaintext password request
 is(@queue, 0, 'queue is empty');
-ok($pg->attach_event('password' => sub {
+ok($pg->add_handler_for_event('password' => sub {
 	my ($self) = shift;
 	pass("have password event");
 	ok($self->send_message('PasswordMessage', password => 'test'), 'generate password message');
@@ -55,7 +55,7 @@ is_hex($msg, '70 00 00 00 09 74 65 73 74 00', 'correct password message');
 my $request_ready = 0;
 my $ready = 0;
 is(@queue, 0, 'queue is empty');
-ok($pg->attach_event('authenticated' => sub {
+ok($pg->add_handler_for_event('authenticated' => sub {
 	my ($self) = shift;
 	pass("have authenticated event");
 #	ok($self->send_message('PasswordMessage', password => 'test'), 'generate password message');
@@ -84,7 +84,7 @@ is_hex($msg, '51 00 00 00 05 00', 'correct SQL query');
 
 is(@queue, 0, 'queue is empty');
 my $empty = 0;
-ok($pg->attach_event('empty_query' => sub {
+ok($pg->add_handler_for_event('empty_query' => sub {
 	my ($self) = @_;
 	++$empty;
 }), 'attach empty query handler');
@@ -97,7 +97,7 @@ is($ready--, 1, 'saw ReadyForQuery event');
 is(@queue, 0, 'queue is empty');
 my $row_desc;
 my $data_row;
-ok($pg->attach_event('row_description' => sub {
+ok($pg->add_handler_for_event('row_description' => sub {
 	my ($self, %args) = @_;
 	die "Had description already" if $row_desc;
 	$row_desc = $args{description};
@@ -129,7 +129,7 @@ is($data_row->[0]->{data}, 1, 'have correct value');
 is($data_row->[0]->{description}->name, 'name', 'have correct field name');
 
 my $rslt;
-ok($pg->attach_event('command_complete' => sub {
+ok($pg->add_handler_for_event('command_complete' => sub {
 	my ($self, %args) = @_;
 	$rslt = $args{result};
 }), 'attach command_complete event');
@@ -162,7 +162,7 @@ is($f->name, 'name', 'name matches');
 
 ok(!$data_row, 'no data row yet');
 my $notice;
-ok($pg->attach_event('notice' => sub {
+ok($pg->add_handler_for_event('notice' => sub {
 	my ($self, %args) = @_;
 	$notice = delete $args{notice};
 }), 'attach notice handler');

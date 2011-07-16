@@ -1,9 +1,10 @@
 package Protocol::PostgreSQL::Statement;
 BEGIN {
-  $Protocol::PostgreSQL::Statement::VERSION = '0.007';
+  $Protocol::PostgreSQL::Statement::VERSION = '0.008';
 }
 use strict;
 use warnings;
+use parent qw(Mixin::Event::Dispatch);
 use Scalar::Util;
 use Data::Dumper;
 
@@ -13,7 +14,7 @@ Protocol::PostgreSQL::Statement - prepared statement handling
 
 =head1 VERSION
 
-version 0.007
+version 0.008
 
 =head1 SYNOPSIS
 
@@ -112,6 +113,7 @@ sub new {
 		rows_seen	=> 0,
 		data_row	=> delete $args{data_row},
 		no_data		=> delete $args{no_data},
+		command_complete => delete $args{command_complete},
 		bind_pending	=> [],
 		execute_pending	=> [],
 	}, $class;
@@ -161,7 +163,10 @@ sub execute {
 		param => $param,
 		sth => $self,
 		  (exists $self->{statement})
-		? (statement	=> $self->{statement})
+		? (
+			statement	=> $self->{statement},
+			portal		=> $self->{statement},
+		)
 		: ()
 	);
 
@@ -179,6 +184,7 @@ sub execute {
 	} else {
 		push @{ $self->{bind_pending} }, $msg;
 	}
+	return $self;
 }
 
 =head2 current_bind_values
@@ -233,7 +239,12 @@ do anything at the moment.
 
 =cut
 
-sub bind_complete { }
+sub bind_complete {
+	my $self = shift;
+
+#	$self->_execute;
+	return $self;
+}
 
 =head2 _execute
 
@@ -249,10 +260,9 @@ sub _execute {
 			'Execute',
 			param => [ @_ ],
 			sth => $self,
-# TODO Should really name the portal, but we'd have to clear up afterwards
-#				  (exists $self->{statement})
-#				? (portal => $self->{statement})
-#				: ()
+			  (exists $self->{statement})
+			? (portal => $self->{statement})
+			: ()
 		);
 		$self->dbh->send_message(
 			'Sync',
@@ -323,6 +333,32 @@ sub on_ready {
 	} else {
 		$self->{on_ready}->() if exists $self->{on_ready};
 	}
+}
+
+sub discard {
+	my $self = shift;
+	my %args = @_;
+
+#	$self->add_handler_for_event(
+#	) if exists $args{on_complete};
+
+	$self->dbh->send_message(
+		'Close',
+		statement	=> defined($self->{statement}) ? $self->{statement} : '',
+		  (exists $args{on_complete})
+		? (on_complete	=> sub { $args{on_complete}->(); 0 })
+		: (),
+		sth		=> $self,
+	);
+	$self->dbh->send_message(
+		'Sync',
+	);
+}
+
+sub on_close_complete {
+	my $self = shift;
+	$self->invoke_event('close_complete' => );
+	return $self;
 }
 
 =head2 finish

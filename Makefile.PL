@@ -2,7 +2,7 @@
 use strict;
 use warnings;
 
-BEGIN { require 5.008; }
+use 5.008;
 
 use ExtUtils::MakeMaker 6.30;
 
@@ -23,11 +23,12 @@ my %WriteMakefileArgs = (
   'NAME' => 'Protocol::PostgreSQL',
   'PREREQ_PM' => {
     'Digest::MD5' => '0',
+    'Mixin::Event::Dispatch' => '0.002',
     'POSIX' => '0',
     'Time::HiRes' => '0',
     'parent' => '0'
   },
-  'VERSION' => '0.007',
+  'VERSION' => '0.008',
   'test' => {
     'TESTS' => 't/*.t'
   }
